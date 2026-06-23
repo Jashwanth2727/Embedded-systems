@@ -1,0 +1,15 @@
+[Unit]
+Description=Connect WiFi and run Python at boot
+After=NetworkManager.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/home/rpi5
+ExecStart=/bin/bash /home/rpi5/startup_wifi_and_run.sh
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
