@@ -18,7 +18,6 @@ WantedBy=multi-user.target
 #sudo systemctl daemon-reload
 #sudo systemctl restart startup-wifi.service
 #sudo systemctl status startup-wifi.service
-Use this command to see actual saved connection names:
 
-bash
-sudo nmcli -f NAME,UUID,TYPE,DEVICE connection show
+#Use this command to see actual saved connection names:
+#sudo nmcli -f NAME,UUID,TYPE,DEVICE connection show
