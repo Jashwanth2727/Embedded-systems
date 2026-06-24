@@ -217,13 +217,14 @@ async def _check_clearvitals():
 # LED controller
 # ---------------------------------------------------------------------------
 
-LED_COUNT  = 8
+LED_COUNT  = 10
 LED_PIN    = 18
 BRIGHTNESS = 0.5
 LED_LOGO   = [0, 1]   # always on
 LED_GLUC   = [2, 3]
 LED_SPO2   = [4, 5]
-LED_BP     = [6, 7]
+LED_MIC    = [6, 7]
+LED_BP     = [8, 9]
 
 def rgb_raw(r, g, b):
     return ((r & 0xFF) << 16) | ((g & 0xFF) << 8) | (b & 0xFF)
@@ -320,7 +321,7 @@ class LEDController:
     def set_bp_active(self, active: bool):
         if self._bp_active != active:
             self._bp_active = active
-            print(f"  [LED] BP LEDs (6-7) → {'ACTIVE' if active else 'OFF'}")
+            print(f"  [LED] BP LEDs (8-9) → {'ACTIVE' if active else 'OFF'}")
 
     def set_spo2_active(self, active: bool):
         if self._spo2_active != active:
@@ -356,8 +357,10 @@ class LEDController:
         elif self.state == LEDState.POST_FLOW:
             if elapsed < GLUC_ON_SECS:
                 self._set_pixels(LED_GLUC, GREEN)
+            if elapsed < LOCKOUT_SECS:
+                self._set_pixels(LED_MIC, GREEN)
         elif self.state == LEDState.ERROR:
-            self._set_pixels(LED_BP + LED_SPO2 + LED_GLUC, RED)
+            self._set_pixels(LED_BP + LED_SPO2 + LED_GLUC + LED_MIC, RED)
         self._show()
 
     def shutdown(self):
@@ -713,8 +716,7 @@ class TempSensor:
                     self._on_notify,
                     bluez=BlueZNotifyArgs(use_start_notify=True),
                 )
-                print(f"  [Temp] Waiting up to {TEMP_BLE_MEASURE_TIMEOUT}s — "
-                      "take a forehead measurement NOW...")
+                print(f"  [Temp] Waiting up to {TEMP_BLE_MEASURE_TIMEOUT}s — take a forehead measurement NOW...")
                 try:
                     await asyncio.wait_for(self._done.wait(), timeout=TEMP_BLE_MEASURE_TIMEOUT)
                 except asyncio.TimeoutError:
@@ -947,7 +949,7 @@ async def run_patient_capture(patient_num, trigger_kind, trigger_device, temp_se
                 print("  [Flow] SpO2 pushed; waiting for already-started BP reading to finish.")
             bp_result = await bp_task
             if bp_result:
-                await push_partial(record_base, bp=bp_result, spo2=spo2_result, temp=None, partial=True)
+                await push_partial(record_base, bp=bpresult, spo2=spo2_result, temp=None, partial=True)
         else:
             if not bp_scan_task.done():
                 bp_scan_task.cancel()
