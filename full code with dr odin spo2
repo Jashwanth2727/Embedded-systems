@@ -1,0 +1,1317 @@
+#!/usr/bin/env python3
+import asyncio
+import builtins
+import csv
+import json
+import shutil
+import socket
+import struct
+import time
+import urllib.request
+import urllib.error
+import logging
+import pexpect
+from datetime import datetime, timezone
+from enum import Enum
+from pathlib import Path
+
+from bleak import BleakClient, BleakScanner
+from bleak.args.bluez import BlueZNotifyArgs
+from dbus_fast.aio import MessageBus
+from dbus_fast import BusType, Variant, Message, MessageType
+
+try:
+    from rpi_ws281x import PixelStrip, Color
+    HAS_LEDS = True
+except ImportError:
+    HAS_LEDS = False
+    print("[warn] rpi_ws281x not installed — LED indicators disabled")
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+BACKEND_URL          = "https://prod.o-health.in/api/v2/vitals/update"
+CLEARVITALS_POLL_URL = "https://prod.o-health.in/api/v2/vitals/latestVitalsForKiosk"
+KIOSK_ID             = socket.gethostname()
+
+# FIXED: force paths to rpi5 home even when running with sudo
+SPOOL_DIR            = Path("/home/rpi5") / "vitals_spool"
+VIDEO_BASE_DIR       = Path("/home/rpi5") / "Videos"
+ALT_VIDEO_ROOT       = Path("/home/rpi5") / "Videos"
+LOG_DIR              = Path("/home/rpi5") / "vitals_logs"
+
+CONSOLE_LOG_PATH     = LOG_DIR / "vitals_kiosk_console.log"
+SESSION_CSV_PATH     = LOG_DIR / "vitals_kiosk_sessions.csv"
+
+PUSH_TIMEOUT                 = 10
+PUSH_RETRIES                 = 2
+PUSH_RETRY_DELAY             = 5
+SCAN_TIMEOUT                 = 8
+CONNECT_TIMEOUT              = 30
+POLL_INTERVAL_SECS           = 15
+POLL_TIMEOUT_SECS            = 8
+BP_MEASURE_TIMEOUT           = 90
+SPO2_MEASURE_TIMEOUT         = 60
+GLUCOSE_MEASURE_TIMEOUT      = 30
+PATIENT_IDLE_PRINT_EVERY     = 60
+TEMP_WAIT_AFTER_SPO2         = 5
+TEMP_SAMPLE_SECS             = 5
+CAMERA_DEVICE                = "/dev/video0"
+CAMERA_RECORD_SECS           = 10
+GLUC_ON_SECS                 = 10
+LOCKOUT_SECS                 = 180
+POST_PRIMARY_FALLBACK_SCAN_SECS = 10
+BLE_DEBUG_LOG                = True
+
+BP_ALLOWED_MAC   = "FF:FF:11:7F:C9:54"
+BP_NAME_HINTS    = ["JPD", "BPM", "TRACKY"]
+BP_NOTIFY        = "0000fff1-0000-1000-8000-00805f9b34fb"
+NOTIFY_ARGS      = BlueZNotifyArgs(use_start_notify=True)
+
+SPO2_ALLOWED_MAC   = "10:22:33:92:69:08"
+SPO2_NAME_HINTS    = ["OPO103", "YK-80B", "OXIMETER", "MY OXIMETER"]
+SPO2_ADAPTER_MAC   = "88:A2:9E:AE:6E:98"
+SPO2_DEVICE_PATH   = "/org/bluez/hci0/dev_10_22_33_92_69_08"
+SPO2_CHAR_PATH     = "/org/bluez/hci0/dev_10_22_33_92_69_08/service0033/char0034"
+SPO2_STABLE_COUNT  = 1
+
+GLUCOSE_ALLOWED_MAC       = "EC:09:C9:BC:93:37"
+GLUCOSE_NAME_HINTS        = ["ACCU-CHEK", "INSTANT"]
+GLUCOSE_SERVICE_UUID      = "00001808-0000-1000-8000-00805f9b34fb"
+GLUCOSE_MEASUREMENT_UUID  = "00002a18-0000-1000-8000-00805f9b34fb"
+RACP_UUID                 = "00002a52-0000-1000-8000-00805f9b34fb"
+GLUCOSE_CONNECT_TIMEOUT   = 20
+GLUCOSE_STREAM_WAIT_SECS  = 10
+
+NULL_BP       = {"sys": None, "dia": None, "pul": None}
+NULL_SPO2     = {"spo2": None, "pr": None, "pi": None}
+NULL_TEMP     = {"ambient_c": None, "object_c": None, "object_c_raw": None,
+                  "display_source": None, "samples": None}
+NULL_GLUCOSE  = {"mg_dl": None, "timestamp": None, "sample_type": None, "sample_location": None}
+
+TEMP_SERVICE_UUID        = "0000fff0-0000-1000-8000-00805f9b34fb"
+TEMP_NOTIFY_UUID         = "0000fff3-0000-1000-8000-00805f9b34fb"
+TEMP_ALLOWED_MAC         = "FF:FF:11:70:75:A2"
+TEMP_NAME_HINTS          = ["THERMOMETER", "MY THERMOMETER"]
+TEMP_BLE_CONNECT_TIMEOUT = 15
+TEMP_BLE_MEASURE_TIMEOUT = 20
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+_console_log_fh = open(CONSOLE_LOG_PATH, "a", buffering=1, encoding="utf-8")
+
+_builtin_print = builtins.print
+
+def _logging_print(*args, **kwargs):
+    _builtin_print(*args, **kwargs)
+    try:
+        text = " ".join(str(a) for a in args)
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        for line in text.splitlines() or [""]:
+            _console_log_fh.write(f"[{ts}] {line}\n")
+    except Exception:
+        pass
+
+print = _logging_print
+
+def log_session_divider():
+    sep = "=" * 70
+    try:
+        _console_log_fh.write(f"\n{sep}\n")
+    except Exception:
+        pass
+
+CSV_FIELDNAMES = [
+    "patient_seq", "session_start", "session_end", "duration_secs", "trigger",
+    "bp_sys", "bp_dia", "bp_pul",
+    "spo2_pct", "spo2_pr", "spo2_pi",
+    "glucose_mg_dl",
+    "temp_ambient_f", "temp_object_f", "temp_display_source",
+    "pushed_ok",
+]
+
+def _ensure_csv_header():
+    if not SESSION_CSV_PATH.exists():
+        with open(SESSION_CSV_PATH, "w", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerow(CSV_FIELDNAMES)
+
+def log_session_csv_row(patient_num, started_at, ended_at, trigger_kind,
+                         bp_result, spo2_result, glucose_result, temp_result, pushed_ok):
+    _ensure_csv_header()
+    duration = (ended_at - started_at).total_seconds()
+    row = [
+        patient_num,
+        started_at.strftime("%Y-%m-%d %H:%M:%S"),
+        ended_at.strftime("%Y-%m-%d %H:%M:%S"),
+        f"{duration:.1f}",
+        trigger_kind,
+        bp_result.get("sys") if bp_result else "",
+        bp_result.get("dia") if bp_result else "",
+        bp_result.get("pul") if bp_result else "",
+        spo2_result.get("spo2") if spo2_result else "",
+        spo2_result.get("pr") if spo2_result else "",
+        spo2_result.get("pi") if spo2_result else "",
+        glucose_result.get("mg_dl") if glucose_result else "",
+        temp_result.get("ambient_c") if temp_result else "",
+        temp_result.get("object_c") if temp_result else "",
+        temp_result.get("display_source") if temp_result else "",
+        "OK" if pushed_ok else "FAILED/SPOOLED",
+    ]
+    try:
+        with open(SESSION_CSV_PATH, "a", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerow(row)
+    except Exception as e:
+        _builtin_print(f"  [log] CSV row write failed: {type(e).__name__}: {e}")
+
+# ---------------------------------------------------------------------------
+# Async helpers
+# ---------------------------------------------------------------------------
+
+_bg_tasks: set = set()
+
+def _track(coro):
+    task = asyncio.create_task(coro)
+    _bg_tasks.add(task)
+    task.add_done_callback(_bg_tasks.discard)
+    return task
+
+_ble_adapter_lock = asyncio.Lock()
+
+async def _quick_disconnect(client):
+    try:
+        async with _ble_adapter_lock:
+            await asyncio.wait_for(client.disconnect(), timeout=1.5)
+    except Exception:
+        pass
+
+# ---------------------------------------------------------------------------
+# Non-blocking HTTP
+# ---------------------------------------------------------------------------
+
+def _push_once(record) -> bool:
+    body = json.dumps(record).encode("utf-8")
+    req  = urllib.request.Request(
+        BACKEND_URL, data=body,
+        headers={"Content-Type": "application/json"}, method="POST"
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=PUSH_TIMEOUT) as resp:
+            print(f"  Backend response: HTTP {resp.status}")
+            return 200 <= resp.status < 300
+    except Exception as e:
+        print(f"  Push failed: {type(e).__name__}: {e}")
+        return False
+
+async def _push_once_async(record) -> bool:
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, _push_once, record)
+
+def _check_clearvitals_sync() -> bool:
+    body = json.dumps({"kiosk_id": KIOSK_ID}).encode("utf-8")
+    req = urllib.request.Request(
+        CLEARVITALS_POLL_URL, data=body,
+        headers={"Content-Type": "application/json"}, method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=POLL_TIMEOUT_SECS) as resp:
+            raw = resp.read().decode("utf-8").strip()
+            if not raw:
+                return False
+            data = json.loads(raw)
+            return data.get("data") is None
+    except urllib.error.HTTPError as e:
+        if e.code != 404:
+            print(f"  [poll] clearvitals HTTP {e.code} (non-fatal)")
+        return False
+    except json.JSONDecodeError:
+        return False
+    except Exception as e:
+        print(f"  [poll] clearvitals check error (non-fatal): {type(e).__name__}: {e}")
+        return False
+
+async def _check_clearvitals():
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, _check_clearvitals_sync)
+
+# ---------------------------------------------------------------------------
+# LED controller
+# ---------------------------------------------------------------------------
+
+LED_COUNT  = 10
+LED_PIN    = 18
+BRIGHTNESS = 0.5
+LED_LOGO   = [0, 1]
+LED_GLUC   = [2, 3]
+LED_SPO2   = [4, 5]
+LED_MIC    = [6, 7]
+LED_BP     = [8, 9]
+
+def rgb_raw(r, g, b):
+    return ((r & 0xFF) << 16) | ((g & 0xFF) << 8) | (b & 0xFF)
+
+def rgb(r, g, b):
+    return rgb_raw(int(r * BRIGHTNESS), int(g * BRIGHTNESS), int(b * BRIGHTNESS))
+
+GREEN      = rgb(0, 255, 0)
+WHITE      = rgb(255, 255, 255)
+RED        = rgb(255, 0, 0)
+OFF        = rgb_raw(0, 0, 0)
+
+BREATH_FADE_STEPS = 25
+BREATH_FADE_DELAY = 0.04
+BREATH_HOLD_SECS  = 0.5
+
+class LEDState(Enum):
+    OFF       = "off"
+    WAIT_BP   = "wait_bp"
+    CAPTURE   = "capture"
+    POST_FLOW = "post_flow"
+    ERROR     = "error"
+
+class LEDController:
+    def __init__(self):
+        self.strip          = None
+        self.state          = LEDState.OFF
+        self._state_started = time.monotonic()
+        self._stop          = False
+        self._bp_active     = False
+        self._spo2_active   = False
+        self._gluc_active   = False
+        if not HAS_LEDS:
+            return
+        try:
+            self.strip = PixelStrip(LED_COUNT, LED_PIN)
+            self.strip.begin()
+            self._all_off()
+            self._set_pixels(LED_LOGO, WHITE)
+            self.strip.show()
+        except Exception as e:
+            print(f"  [warn] LED init failed: {type(e).__name__}: {e}")
+            self.strip = None
+
+    def _all_off(self):
+        if not self.strip:
+            return
+        for i in range(LED_COUNT):
+            self.strip.setPixelColor(i, OFF)
+        self.strip.show()
+
+    def _set_pixels(self, leds, color):
+        if not self.strip:
+            return
+        for i in leds:
+            self.strip.setPixelColor(i, color)
+
+    def _show(self):
+        if self.strip:
+            self.strip.show()
+
+    @staticmethod
+    def _scale(color, factor):
+        r = (color >> 16) & 0xFF
+        g = (color >> 8)  & 0xFF
+        b =  color        & 0xFF
+        return rgb_raw(int(r * factor), int(g * factor), int(b * factor))
+
+    @staticmethod
+    def _breath_factor(elapsed):
+        cycle_len = 2 * (BREATH_FADE_STEPS * BREATH_FADE_DELAY) + 2 * BREATH_HOLD_SECS
+        t         = elapsed % cycle_len
+        fade_dur  = BREATH_FADE_STEPS * BREATH_FADE_DELAY
+        if t < fade_dur:
+            return t / fade_dur
+        t -= fade_dur
+        if t < BREATH_HOLD_SECS:
+            return 1.0
+        t -= BREATH_HOLD_SECS
+        if t < fade_dur:
+            return 1.0 - (t / fade_dur)
+        return 0.0
+
+    def set_state(self, new_state: LEDState):
+        if self.state != new_state:
+            print(f"  [LED] {self.state.value} -> {new_state.value}")
+            self.state          = new_state
+            self._state_started = time.monotonic()
+            if new_state in (LEDState.OFF, LEDState.ERROR, LEDState.POST_FLOW):
+                self._bp_active   = False
+                self._spo2_active = False
+                self._gluc_active = False
+
+    def set_bp_active(self, active: bool):
+        if self._bp_active != active:
+            self._bp_active = active
+            print(f"  [LED] BP LEDs (8-9) → {'ACTIVE' if active else 'OFF'}")
+
+    def set_spo2_active(self, active: bool):
+        if self._spo2_active != active:
+            self._spo2_active = active
+            print(f"  [LED] SpO2 LEDs (4-5) → {'ACTIVE' if active else 'OFF'}")
+
+    def set_gluc_active(self, active: bool):
+        if self._gluc_active != active:
+            self._gluc_active = active
+            print(f"  [LED] Glucose LEDs (2-3) → {'ACTIVE' if active else 'OFF'}")
+
+    async def run(self):
+        if not self.strip:
+            return
+        try:
+            while not self._stop:
+                self._render()
+                await asyncio.sleep(BREATH_FADE_DELAY)
+        finally:
+            self._all_off()
+
+    def _render(self):
+        if not self.strip:
+            return
+        elapsed = time.monotonic() - self._state_started
+        for i in range(LED_COUNT):
+            self.strip.setPixelColor(i, OFF)
+        self._set_pixels(LED_LOGO, WHITE)
+        if self.state == LEDState.WAIT_BP:
+            f = self._breath_factor(elapsed)
+            self._set_pixels(LED_BP, self._scale(GREEN, f))
+        elif self.state == LEDState.CAPTURE:
+            f = self._breath_factor(elapsed)
+            if self._bp_active:
+                self._set_pixels(LED_BP, self._scale(GREEN, f))
+            if self._spo2_active:
+                self._set_pixels(LED_SPO2, self._scale(GREEN, f))
+            if self._gluc_active:
+                self._set_pixels(LED_GLUC, self._scale(GREEN, f))
+        elif self.state == LEDState.POST_FLOW:
+            if elapsed < GLUC_ON_SECS:
+                self._set_pixels(LED_GLUC, GREEN)
+            if elapsed < LOCKOUT_SECS:
+                self._set_pixels(LED_MIC, GREEN)
+        elif self.state == LEDState.ERROR:
+            self._set_pixels(LED_BP + LED_SPO2 + LED_GLUC + LED_MIC, RED)
+        self._show()
+
+    def shutdown(self):
+        self._stop = True
+        if self.strip:
+            self._all_off()
+
+# ---------------------------------------------------------------------------
+# BLE helpers
+# ---------------------------------------------------------------------------
+
+def _normalize_mac(addr):
+    return (addr or "").strip().upper()
+
+def _is_bp_device(dev):
+    if not dev:
+        return False
+    if _normalize_mac(dev.address) == _normalize_mac(BP_ALLOWED_MAC):
+        return True
+    if dev.name and any(h in dev.name.upper() for h in BP_NAME_HINTS):
+        return True
+    return False
+
+def _is_spo2_device(dev):
+    if not dev:
+        return False
+    if _normalize_mac(dev.address) == _normalize_mac(SPO2_ALLOWED_MAC):
+        return True
+    if dev.name and any(h in dev.name.upper() for h in SPO2_NAME_HINTS):
+        return True
+    return False
+
+def _is_glucose_device(dev):
+    if not dev:
+        return False
+    if _normalize_mac(dev.address) == _normalize_mac(GLUCOSE_ALLOWED_MAC):
+        return True
+    if dev.name and any(h in dev.name.upper() for h in GLUCOSE_NAME_HINTS):
+        return True
+    return False
+
+async def scan_known_devices(timeout=SCAN_TIMEOUT):
+    found_bp   = None
+    found_spo2 = None
+    found_gluc = None
+    try:
+        devices = await BleakScanner.discover(timeout=timeout, return_adv=False)
+    except Exception as e:
+        print(f"  [BLE] Scan failed: {type(e).__name__}: {e}")
+        return None, None, None
+    for dev in devices:
+        if BLE_DEBUG_LOG:
+            print(f"  [BLE seen] {dev.name or '(unnamed)'} @ {dev.address}")
+        if _is_bp_device(dev):
+            found_bp = dev
+            print(f"  [BLE match] BP candidate: {dev.name or '(unnamed)'} @ {dev.address}")
+        if _is_spo2_device(dev):
+            found_spo2 = dev
+            print(f"  [BLE match] SpO2 candidate: {dev.name or '(unnamed)'} @ {dev.address}")
+        if _is_glucose_device(dev):
+            found_gluc = dev
+            print(f"  [BLE match] Glucose candidate: {dev.name or '(unnamed)'} @ {dev.address}")
+    return found_bp, found_spo2, found_gluc
+
+async def scan_for_specific_device(kind: str, timeout: int, leds=None):
+    print(f"  [{kind}] Scanning up to {timeout}s for connection...")
+
+    def _set_active(k, active):
+        if leds:
+            if k == "BP":
+                leds.set_bp_active(active)
+            elif k == "SpO2":
+                leds.set_spo2_active(active)
+            elif k == "Glucose":
+                leds.set_gluc_active(active)
+
+    try:
+        _set_active(kind, True)
+        start = time.monotonic()
+        while time.monotonic() - start < timeout:
+            remaining    = timeout - (time.monotonic() - start)
+            pass_timeout = min(5, max(2, remaining))
+            bp_dev, spo2_dev, gluc_dev = await scan_known_devices(timeout=pass_timeout)
+            if kind == "BP" and bp_dev:
+                print(f"  [BP] Found during secondary scan: {bp_dev.name or '(unnamed)'} @ {bp_dev.address}")
+                return bp_dev
+            if kind == "SpO2" and spo2_dev:
+                print(f"  [SpO2] Found during secondary scan: {spo2_dev.name or '(unnamed)'} @ {spo2_dev.address}")
+                return spo2_dev
+            if kind == "Glucose" and gluc_dev:
+                print(f"  [Glucose] Found during secondary scan: {gluc_dev.name or '(unnamed)'} @ {gluc_dev.address}")
+                return gluc_dev
+            await asyncio.sleep(0.5)
+        print(f"  [{kind}] Not found within {timeout}s — skipping {kind}.")
+        return None
+    finally:
+        _set_active(kind, False)
+
+async def wait_for_patient_device():
+    print("\n>>> WAITING FOR PATIENT — power on BP cuff, SpO2, or Glucose meter to begin <<<\n")
+    last_print = time.time()
+    started    = time.time()
+    while True:
+        bp_dev, spo2_dev, gluc_dev = await scan_known_devices(timeout=SCAN_TIMEOUT)
+        if bp_dev:
+            print(f"  ✓ Patient trigger detected from BP: {bp_dev.name or '(unnamed)'} @ {bp_dev.address}")
+            return "BP", bp_dev
+        if spo2_dev:
+            print(f"  ✓ Patient trigger detected from SpO2: {spo2_dev.name or '(unnamed)'} @ {spo2_dev.address}")
+            return "SpO2", spo2_dev
+        if gluc_dev:
+            print(f"  ✓ Patient trigger detected from Glucose: {gluc_dev.name or '(unnamed)'} @ {gluc_dev.address}")
+            return "Glucose", gluc_dev
+        now = time.time()
+        if now - last_print >= PATIENT_IDLE_PRINT_EVERY:
+            print(f"  ... still waiting ({int((now - started) / 60)} min elapsed)")
+            last_print = now
+        await asyncio.sleep(2)
+
+# ---------------------------------------------------------------------------
+# BP Session
+# ---------------------------------------------------------------------------
+
+class BPSession:
+    def __init__(self, leds=None):
+        self.result = None
+        self.done   = asyncio.Event()
+        self.leds   = leds
+        self._debug_frames = 0
+
+    def on_notify(self, _, data):
+        if self.done.is_set():
+            return
+        if self._debug_frames < 20:
+            print(f"  [BP raw] {bytes(data).hex()}")
+            self._debug_frames += 1
+        if (len(data) == 8
+                and data[0] == 0xFD and data[1] == 0xFD and data[2] == 0xFC
+                and data[-2:] == b'\x0D\x0A'):
+            self.result = {"sys": data[3], "dia": data[4], "pul": data[5]}
+            print(f"  ✓ BP: {data[3]}/{data[4]} mmHg, pulse {data[5]}")
+            self.done.set()
+
+    async def run(self, device):
+        if not device:
+            print("  [BP] No BP device available — skipping BP.")
+            return None
+        client = BleakClient(device, timeout=CONNECT_TIMEOUT)
+        all_notify_tasks = []
+        watcher_task = None
+        max_retries = 5
+
+        async def _subscribe_with_retries():
+            attempt = 0
+            while attempt < max_retries and not self.done.is_set():
+                attempt += 1
+                async with _ble_adapter_lock:
+                    t = asyncio.create_task(client.start_notify(BP_NOTIFY, self.on_notify, bluez=NOTIFY_ARGS))
+                    all_notify_tasks.append(t)
+                    done_set, _ = await asyncio.wait([t], timeout=3.0)
+                if self.done.is_set():
+                    return
+                if done_set:
+                    exc = t.exception()
+                    if exc:
+                        print(f"  [BP] start_notify attempt {attempt} failed: {type(exc).__name__}: {exc}")
+                        continue
+                    print(f"  [BP] Notify subscribed ✓ (attempt {attempt})")
+                    return
+                else:
+                    print(f"  [BP] Notify subscription pending (attempt {attempt}, continuing)")
+                    try:
+                        await t
+                        print(f"  [BP] Notify subscribed ✓ (attempt {attempt}, late)")
+                        return
+                    except Exception as e:
+                        if self.done.is_set():
+                            return
+                        print(f"  [BP] start_notify attempt {attempt} failed late: {type(e).__name__}: {e}")
+                        continue
+            if not self.done.is_set() and attempt >= max_retries:
+                print(f"  [BP] Gave up resubscribing after {max_retries} attempts.")
+
+        try:
+            if self.leds:
+                self.leds.set_bp_active(True)
+            async with _ble_adapter_lock:
+                await client.connect()
+            print("  [BP] Connected ✓")
+            await asyncio.sleep(0.5)
+            watcher_task = asyncio.create_task(_subscribe_with_retries())
+            if self.done.is_set():
+                print(f"  [BP] Value captured during subscription — done.")
+            else:
+                print(f"  [BP] Measurement timer started ({BP_MEASURE_TIMEOUT}s)")
+                print(f"  Press START on the BP cuff. ({BP_MEASURE_TIMEOUT}s to complete)")
+                try:
+                    await asyncio.wait_for(self.done.wait(), timeout=BP_MEASURE_TIMEOUT)
+                except asyncio.TimeoutError:
+                    print(f"  [BP] ⚠ Measurement timed out after {BP_MEASURE_TIMEOUT}s — skipping BP.")
+        except Exception as e:
+            print(f"  [BP] Connection/measurement failed: {type(e).__name__}: {e}")
+        finally:
+            if watcher_task and not watcher_task.done():
+                watcher_task.cancel()
+            for t in all_notify_tasks:
+                if not t.done():
+                    t.cancel()
+                else:
+                    try:
+                        t.result()
+                    except Exception:
+                        pass
+            _track(_quick_disconnect(client))
+            if self.leds:
+                self.leds.set_bp_active(False)
+        return self.result
+
+# ---------------------------------------------------------------------------
+# SpO2 reader
+# ---------------------------------------------------------------------------
+
+def _spo2_valid(spo2, pr):
+    return 50 <= spo2 <= 100 and 30 <= pr <= 250
+
+def _bluetoothctl_connect_spo2():
+    print("  [SpO2] Connecting via bluetoothctl...")
+    child = pexpect.spawn("bluetoothctl", encoding="utf-8", timeout=5)
+    time.sleep(0.5)
+
+    child.sendline(f"select {SPO2_ADAPTER_MAC}")
+    time.sleep(0.3)
+
+    child.sendline("scan on")
+    time.sleep(5)
+
+    child.sendline(f"trust {SPO2_ALLOWED_MAC}")
+    time.sleep(0.5)
+
+    child.sendline(f"connect {SPO2_ALLOWED_MAC}")
+
+    try:
+        child.expect("ServicesResolved: yes", timeout=20)
+        print("  [SpO2] CONNECTED via bluetoothctl ✓")
+        return child
+    except pexpect.TIMEOUT:
+        print("  [SpO2] Connection failed via bluetoothctl")
+        try:
+            child.sendline("quit")
+            child.close()
+        except Exception:
+            pass
+        return None
+
+async def capture_spo2_new(adapter_lock=None) -> dict:
+    lock = adapter_lock or _ble_adapter_lock
+    result = {"spo2": None, "pr": None, "pi": None}
+    done_event = asyncio.Event()
+    btctl_child = None
+    bus = None
+
+    async with lock:
+        btctl_child = await asyncio.to_thread(_bluetoothctl_connect_spo2)
+        if btctl_child is None:
+            return result
+
+        await asyncio.sleep(2)
+        print("  [SpO2] Subscribing via D-Bus...")
+
+        try:
+            bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
+
+            def on_signal(msg):
+                if done_event.is_set():
+                    return
+                if msg.message_type != MessageType.SIGNAL:
+                    return
+                if msg.member != "PropertiesChanged":
+                    return
+                if SPO2_CHAR_PATH not in msg.path:
+                    return
+
+                changed = msg.body[1]
+                if not isinstance(changed, dict) or "Value" not in changed:
+                    return
+
+                val = changed["Value"]
+                data = bytes(val.value if isinstance(val, Variant) else val)
+
+                if len(data) < 4 or data[0] != 0x81:
+                    return
+
+                spo2 = data[1]
+                pr   = data[2]
+                pi   = round(data[3] / 10, 1)
+
+                if not _spo2_valid(spo2, pr):
+                    return
+
+                result.update({"spo2": spo2, "pr": pr, "pi": pi})
+                print(f"  ✓ SpO2 captured on first valid frame: SpO2={spo2}% PR={pr}bpm PI={pi}%")
+                done_event.set()
+
+            bus.add_message_handler(on_signal)
+
+            await bus.call(Message(
+                destination="org.freedesktop.DBus",
+                path="/org/freedesktop/DBus",
+                interface="org.freedesktop.DBus",
+                member="AddMatch",
+                signature="s",
+                body=[
+                    f"type='signal',sender='org.bluez',"
+                    f"interface='org.freedesktop.DBus.Properties',"
+                    f"member='PropertiesChanged',"
+                    f"path='{SPO2_CHAR_PATH}'"
+                ]
+            ))
+            print("  [SpO2] D-Bus match rule added")
+
+            char_intro = await bus.introspect("org.bluez", SPO2_CHAR_PATH)
+            char_obj = bus.get_proxy_object("org.bluez", SPO2_CHAR_PATH, char_intro)
+            char_gatt = char_obj.get_interface("org.bluez.GattCharacteristic1")
+
+            await char_gatt.call_start_notify()
+            print(f"  [SpO2] StartNotify called. Insert finger. ({SPO2_MEASURE_TIMEOUT}s timeout)")
+
+            try:
+                await asyncio.wait_for(done_event.wait(), timeout=SPO2_MEASURE_TIMEOUT)
+            except asyncio.TimeoutError:
+                print(f"  [SpO2] ⚠ Measurement timed out after {SPO2_MEASURE_TIMEOUT}s")
+            finally:
+                try:
+                    await char_gatt.call_stop_notify()
+                except Exception:
+                    pass
+
+        except Exception as e:
+            print(f"  [SpO2] D-Bus error: {type(e).__name__}: {e}")
+        finally:
+            if bus:
+                try:
+                    bus.disconnect()
+                except Exception:
+                    pass
+            if btctl_child:
+                try:
+                    btctl_child.sendline(f"disconnect {SPO2_ALLOWED_MAC}")
+                    time.sleep(0.5)
+                    btctl_child.sendline("quit")
+                    btctl_child.close()
+                except Exception:
+                    pass
+
+    return result
+
+class SpO2Session:
+    def __init__(self, warmup_frames=1, leds=None):
+        self.leds = leds
+
+    async def run(self, device=None):
+        if self.leds:
+            self.leds.set_spo2_active(True)
+        try:
+            result = await capture_spo2_new()
+            if result["spo2"] is None:
+                print("  [SpO2] No valid reading captured.")
+                return None
+            return result
+        except Exception as e:
+            print(f"  [SpO2] Connection/measurement failed: {type(e).__name__}: {e}")
+            return None
+        finally:
+            if self.leds:
+                self.leds.set_spo2_active(False)
+
+# ---------------------------------------------------------------------------
+# Glucose meter
+# ---------------------------------------------------------------------------
+
+def sfloat_to_float(raw):
+    mantissa = raw & 0x0FFF
+    exponent = raw >> 12
+    if exponent >= 0x8:
+        exponent -= 0x10
+    if mantissa >= 0x0800:
+        mantissa -= 0x1000
+    if mantissa == 0x07FF:
+        return None
+    return mantissa * (10 ** exponent)
+
+def parse_glucose_measurement(data: bytearray):
+    offset = 0
+    flags = data[offset]
+    offset += 1
+
+    time_offset_present    = bool(flags & 0x01)
+    glucose_present        = bool(flags & 0x02)
+    unit_mol_per_l         = bool(flags & 0x04)
+    sensor_status_present  = bool(flags & 0x08)
+    context_follows        = bool(flags & 0x10)
+
+    seq_number = struct.unpack_from("<H", data, offset)[0]
+    offset += 2
+
+    year, month, day, hour, minute, second = struct.unpack_from("<HBBBBB", data, offset)
+    offset += 7
+    timestamp = datetime(year, month, day, hour, minute, second)
+
+    result = {
+        "sequence_number": seq_number,
+        "timestamp": timestamp,
+        "context_follows": context_follows,
+    }
+
+    if time_offset_present:
+        result["time_offset_minutes"] = struct.unpack_from("<h", data, offset)[0]
+        offset += 2
+
+    if glucose_present:
+        raw = struct.unpack_from("<H", data, offset)[0]
+        offset += 2
+        value = sfloat_to_float(raw)
+        unit = "mol/L" if unit_mol_per_l else "kg/L"
+        mg_dl = value * 100000 if (value is not None and not unit_mol_per_l) else None
+        result["glucose_value_raw"] = value
+        result["unit"] = unit
+        result["glucose_mg_dl"] = mg_dl
+
+        type_loc = data[offset]
+        offset += 1
+        result["sample_type"] = type_loc >> 4
+        result["sample_location"] = type_loc & 0x0F
+
+    if sensor_status_present:
+        result["sensor_status"] = struct.unpack_from("<H", data, offset)[0]
+        offset += 2
+
+    return result
+
+class GlucoseSession:
+    def __init__(self, leds=None):
+        self.leds     = leds
+        self.readings = []
+        self.done     = asyncio.Event()
+
+    def _meas_handler(self, sender, data: bytearray):
+        try:
+            reading = parse_glucose_measurement(data)
+            self.readings.append(reading)
+            print(f"  [Glucose] mg/dL={reading.get('glucose_mg_dl')} seq={reading.get('sequence_number')}")
+        except Exception as e:
+            print(f"  [Glucose] Parse error: {type(e).__name__}: {e}")
+
+    def _racp_handler(self, sender, data: bytearray):
+        print(f"  [Glucose] RACP response: {data.hex()}")
+        self.done.set()
+
+    async def run(self, device):
+        if not device:
+            print("  [Glucose] No glucose device available — skipping.")
+            return None
+        if self.leds:
+            self.leds.set_gluc_active(True)
+        try:
+            async with BleakClient(device, timeout=GLUCOSE_CONNECT_TIMEOUT) as client:
+                print("  [Glucose] Connected ✓")
+
+                glucose_service = client.services.get_service(GLUCOSE_SERVICE_UUID)
+                if not glucose_service:
+                    print("  [Glucose] Service not found on device.")
+                    return None
+
+                meas_char = glucose_service.get_characteristic(GLUCOSE_MEASUREMENT_UUID)
+                racp_char = glucose_service.get_characteristic(RACP_UUID)
+
+                await client.start_notify(meas_char, self._meas_handler)
+                await client.start_notify(racp_char, self._racp_handler)
+
+                print("  [Glucose] Requesting all stored records...")
+                await client.write_gatt_char(racp_char, bytearray([0x01, 0x01]), response=True)
+
+                try:
+                    await asyncio.wait_for(self.done.wait(), timeout=GLUCOSE_STREAM_WAIT_SECS)
+                except asyncio.TimeoutError:
+                    print("  [Glucose] ⚠ RACP response timeout — using readings collected so far.")
+
+                try:
+                    await client.stop_notify(meas_char)
+                    await client.stop_notify(racp_char)
+                except Exception:
+                    pass
+        except Exception as e:
+            print(f"  [Glucose] Connection/measurement failed: {type(e).__name__}: {e}")
+            return None
+        finally:
+            if self.leds:
+                self.leds.set_gluc_active(False)
+
+        if not self.readings:
+            print("  [Glucose] No readings captured.")
+            return None
+
+        latest = max(self.readings, key=lambda r: r.get("sequence_number", 0))
+        result = {
+            "mg_dl":           latest.get("glucose_mg_dl"),
+            "timestamp":       latest["timestamp"].isoformat() if latest.get("timestamp") else None,
+            "sample_type":     latest.get("sample_type"),
+            "sample_location": latest.get("sample_location"),
+        }
+        print(f"  ✓ Glucose: {result['mg_dl']} mg/dL @ {result['timestamp']}")
+        return result
+
+# ---------------------------------------------------------------------------
+# Temperature sensor
+# ---------------------------------------------------------------------------
+
+class TempSensor:
+    def __init__(self):
+        self._celsius = None
+        self._done    = asyncio.Event()
+
+    def _on_notify(self, _handle, data: bytearray):
+        if self._done.is_set():
+            return
+        if len(data) == 5 and data[0] == 0xAA and data[1] == 0x33:
+            try:
+                raw_value     = int.from_bytes(data[2:4], byteorder="big", signed=False)
+                self._celsius = raw_value / 100.0
+                print(f"  [Temp BLE raw] {' '.join(f'{b:02X}' for b in data)}")
+                self._done.set()
+            except Exception as e:
+                print(f"  [Temp BLE parse error] {e}")
+
+    async def _find_device(self):
+        print(f"  [Temp] Trying known MAC {TEMP_ALLOWED_MAC} first...")
+        device = await BleakScanner.find_device_by_address(TEMP_ALLOWED_MAC, timeout=5)
+        if not device:
+            print("  [Temp] MAC not cached — scanning for thermometer by name...")
+            devices = await BleakScanner.discover(timeout=10)
+            for d in devices:
+                if d.name and any(h in d.name.upper() for h in TEMP_NAME_HINTS):
+                    device = d
+                    print(f"  [Temp] Found by name: {d.name} @ {d.address}")
+                    break
+        return device
+
+    async def read_average(self):
+        print(f"  [Temp] Waiting {TEMP_WAIT_AFTER_SPO2}s before BLE thermometer scan...")
+        await asyncio.sleep(TEMP_WAIT_AFTER_SPO2)
+
+        self._celsius = None
+        self._done.clear()
+
+        device = await self._find_device()
+        if not device:
+            print("  [Temp] ✗ Thermometer not found — press measure button to wake BLE.")
+            return None
+
+        print(f"  [Temp] Connecting to {device.name or device.address}...")
+        try:
+            async with BleakClient(device, timeout=TEMP_BLE_CONNECT_TIMEOUT) as client:
+                print("  [Temp] Connected ✓  Subscribing to FFF3...")
+                await client.start_notify(
+                    TEMP_NOTIFY_UUID,
+                    self._on_notify,
+                    bluez=BlueZNotifyArgs(use_start_notify=True),
+                )
+                print(f"  [Temp] Waiting up to {TEMP_BLE_MEASURE_TIMEOUT}s — take a forehead measurement NOW...")
+                try:
+                    await asyncio.wait_for(self._done.wait(), timeout=TEMP_BLE_MEASURE_TIMEOUT)
+                except asyncio.TimeoutError:
+                    print("  [Temp] ⚠ Timeout — no packet received.")
+                finally:
+                    try:
+                        await client.stop_notify(TEMP_NOTIFY_UUID)
+                    except Exception:
+                        pass
+        except Exception as e:
+            print(f"  [Temp] BLE connection/measurement failed: {type(e).__name__}: {e}")
+            return None
+
+        if self._celsius is None:
+            return None
+
+        celsius    = self._celsius
+        fahrenheit = round(celsius * 9.0 / 5.0 + 32.0, 2)
+
+        print(f"  ✓ Temp: {celsius:.2f}°C  ({fahrenheit:.2f}°F)  [ble_direct]")
+        return {
+            "ambient_c":      None,
+            "object_c":       fahrenheit,
+            "object_c_raw":   fahrenheit,
+            "display_source": "ble_direct",
+            "samples":        1,
+        }
+
+# ---------------------------------------------------------------------------
+# Backend push / spool
+# ---------------------------------------------------------------------------
+
+async def push_to_backend_with_retry(record):
+    total = 1 + PUSH_RETRIES
+    for attempt in range(1, total + 1):
+        print(f"\n  [push attempt {attempt}/{total}] -> {BACKEND_URL}")
+        if await _push_once_async(record):
+            print("  ✓ Pushed.")
+            return True
+        if attempt < total:
+            print(f"  Will retry in {PUSH_RETRY_DELAY}s...")
+            await asyncio.sleep(PUSH_RETRY_DELAY)
+    print(f"  ✗ All {total} push attempts failed.")
+    return False
+
+async def push_partial(record_base: dict, bp, spo2, glucose, temp, partial: bool):
+    snapshot = {
+        **record_base,
+        "bp":      bp      if bp      is not None else NULL_BP,
+        "spo2":    spo2    if spo2    is not None else NULL_SPO2,
+        "glucose": glucose if glucose is not None else NULL_GLUCOSE,
+        "temp":    temp    if temp    is not None else NULL_TEMP,
+        "partial": partial,
+    }
+    label = "partial" if partial else "final"
+    print(f"\n  [SSE {label} push] bp={'captured' if bp else 'null'}  "
+          f"spo2={'captured' if spo2 else 'null'}  "
+          f"glucose={'captured' if glucose else 'null'}  "
+          f"temp={'captured' if temp else 'null'}")
+    if partial:
+        _track(_push_once_async(snapshot))
+        return None
+    else:
+        pushed = await push_to_backend_with_retry(snapshot)
+        if not pushed:
+            spool_to_disk(snapshot)
+        return pushed
+
+def spool_to_disk(record):
+    SPOOL_DIR.mkdir(parents=True, exist_ok=True)
+    path = SPOOL_DIR / f"vitals_{int(time.time())}.json"
+    path.write_text(json.dumps(record, indent=2))
+    print(f"  Spooled: {path}")
+
+async def drain_spool():
+    if not SPOOL_DIR.exists():
+        return
+    loop  = asyncio.get_running_loop()
+    files = sorted(SPOOL_DIR.glob("vitals_*.json"))
+    for f in files:
+        try:
+            record = json.loads(f.read_text())
+            ok     = await loop.run_in_executor(None, _push_once, record)
+            if ok:
+                f.unlink()
+                print(f"  [spool] Pushed and removed {f.name}")
+            else:
+                break
+        except Exception as e:
+            print(f"  [spool] Skipping {f.name}: {e}")
+
+# ---------------------------------------------------------------------------
+# ClearVitals polling
+# ---------------------------------------------------------------------------
+
+async def poll_for_clearvitals(skip_event: asyncio.Event) -> None:
+    print(f"  [poll] Polling latestVitalsForKiosk every {POLL_INTERVAL_SECS}s "
+          f"— will exit lockout early if data becomes null (clearvitals called)")
+    while not skip_event.is_set():
+        await asyncio.sleep(POLL_INTERVAL_SECS)
+        if skip_event.is_set():
+            return
+        triggered = await _check_clearvitals()
+        if triggered:
+            print("  [poll] clearvitals signal received — ending lockout early")
+            skip_event.set()
+            return
+
+# ---------------------------------------------------------------------------
+# Camera / video
+# ---------------------------------------------------------------------------
+
+async def record_video(patient_num: int, leds):
+    date_str = datetime.now().strftime("%Y-%m-%d")
+    time_str = datetime.now().strftime("%H%M%S")
+
+    main_folder = VIDEO_BASE_DIR / date_str
+    main_folder.mkdir(parents=True, exist_ok=True)
+
+    filename = f"patient{patient_num}_{time_str}.mp4"
+    out_path = main_folder / filename
+
+    cmd = [
+        "ffmpeg", "-y", "-f", "v4l2", "-input_format", "mjpeg",
+        "-video_size", "1920x1080", "-framerate", "30",
+        "-i", CAMERA_DEVICE,
+        "-t", str(CAMERA_RECORD_SECS),
+        "-vcodec", "copy",
+        str(out_path),
+    ]
+
+    print(f"\n  [Camera] Recording {CAMERA_RECORD_SECS}s -> {out_path}")
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await asyncio.wait_for(
+            proc.communicate(), timeout=CAMERA_RECORD_SECS + 10
+        )
+        if proc.returncode == 0:
+            print(f"  [Camera] ✓ Saved: {out_path}")
+        else:
+            err = stderr.decode(errors="replace").strip().splitlines()
+            print(f"  [Camera] ffmpeg error (rc={proc.returncode}): "
+                  f"{err[-1] if err else '(no output)'}")
+            return None
+    except Exception as e:
+        print(f"  [Camera] Error: {type(e).__name__}: {e}")
+        return None
+
+    return out_path
+
+# ---------------------------------------------------------------------------
+# Patient capture
+# ---------------------------------------------------------------------------
+
+_SESSION_CLASSES = {
+    "BP":      BPSession,
+    "SpO2":    SpO2Session,
+    "Glucose": GlucoseSession,
+}
+_SESSION_TIMEOUTS = {
+    "BP":      BP_MEASURE_TIMEOUT,
+    "SpO2":    SPO2_MEASURE_TIMEOUT,
+    "Glucose": GLUCOSE_CONNECT_TIMEOUT + GLUCOSE_STREAM_WAIT_SECS,
+}
+
+async def run_patient_capture(patient_num, trigger_kind, trigger_device, temp_sensor, leds):
+    session_started_at = datetime.now()
+    print(f"\n{'#' * 60}")
+    print(f"# PATIENT #{patient_num} @ {session_started_at.strftime('%Y-%m-%d %H:%M:%S')}")
+    print('#' * 60)
+    record_base = {
+        "kiosk_id":    KIOSK_ID,
+        "patient_seq": patient_num,
+        "ts":          datetime.now(timezone.utc).isoformat(),
+    }
+
+    leds.set_state(LEDState.CAPTURE)
+    leds.set_bp_active(False)
+    leds.set_spo2_active(False)
+    leds.set_gluc_active(False)
+
+    results = {"BP": None, "SpO2": None, "Glucose": None}
+    pushed_partial_for = set()
+
+    print(f"\n=== BP + SpO2 + Glucose (trigger: {trigger_kind}) ===")
+
+    trigger_task = asyncio.create_task(
+        _SESSION_CLASSES[trigger_kind](leds=leds).run(trigger_device)
+    )
+    task_to_kind = {trigger_task: trigger_kind}
+
+    other_kinds = [k for k in ("BP", "SpO2", "Glucose") if k != trigger_kind]
+    other_scan_tasks = {
+        k: asyncio.create_task(
+            scan_for_specific_device(k, _SESSION_TIMEOUTS[trigger_kind] + CONNECT_TIMEOUT + 5, leds=leds)
+        )
+        for k in other_kinds
+    }
+    other_run_tasks = {k: None for k in other_kinds}
+
+    pending_tasks = {trigger_task, *other_scan_tasks.values()}
+
+    while pending_tasks:
+        done, pending_tasks = await asyncio.wait(
+            pending_tasks, timeout=0.2, return_when=asyncio.FIRST_COMPLETED
+        )
+
+        for task in done:
+            if task in task_to_kind:
+                kind = task_to_kind[task]
+                try:
+                    results[kind] = task.result()
+                except Exception as e:
+                    print(f"  [{kind}] Task failed: {type(e).__name__}: {e}")
+                    results[kind] = None
+
+                if results[kind] and kind not in pushed_partial_for:
+                    await push_partial(
+                        record_base,
+                        bp=results["BP"],
+                        spo2=results["SpO2"],
+                        glucose=results["Glucose"],
+                        temp=None,
+                        partial=True
+                    )
+                    pushed_partial_for.add(kind)
+
+            else:
+                scan_kind = None
+                for k, scan_task in other_scan_tasks.items():
+                    if scan_task is task:
+                        scan_kind = k
+                        break
+
+                if scan_kind is None:
+                    continue
+
+                try:
+                    dev = task.result()
+                except Exception as e:
+                    print(f"  [{scan_kind}] Scan task failed: {type(e).__name__}: {e}")
+                    dev = None
+
+                if dev and other_run_tasks[scan_kind] is None:
+                    run_task = asyncio.create_task(_SESSION_CLASSES[scan_kind](leds=leds).run(dev))
+                    other_run_tasks[scan_kind] = run_task
+                    task_to_kind[run_task] = scan_kind
+                    pending_tasks.add(run_task)
+
+    for k in other_kinds:
+        if results[k] is None and other_run_tasks[k] is None:
+            print(f"  [Flow] {k} not found before primary window; waiting {POST_PRIMARY_FALLBACK_SCAN_SECS}s more.")
+            dev = await scan_for_specific_device(k, POST_PRIMARY_FALLBACK_SCAN_SECS, leds=leds)
+            if dev:
+                try:
+                    results[k] = await _SESSION_CLASSES[k](leds=leds).run(dev)
+                    if results[k] and k not in pushed_partial_for:
+                        await push_partial(
+                            record_base,
+                            bp=results["BP"],
+                            spo2=results["SpO2"],
+                            glucose=results["Glucose"],
+                            temp=None,
+                            partial=True
+                        )
+                        pushed_partial_for.add(k)
+                except Exception as e:
+                    print(f"  [{k}] Fallback run failed: {type(e).__name__}: {e}")
+
+    print("\n=== Temperature ===")
+    temp_result = await temp_sensor.read_average()
+
+    print("\n=== Video ===")
+    await record_video(patient_num, leds)
+
+    print("\n=== Final Push ===")
+    pushed_ok = await push_partial(
+        record_base, bp=results["BP"], spo2=results["SpO2"],
+        glucose=results["Glucose"], temp=temp_result, partial=False
+    )
+
+    session_ended_at = datetime.now()
+    log_session_csv_row(
+        patient_num, session_started_at, session_ended_at, trigger_kind,
+        results["BP"], results["SpO2"], results["Glucose"], temp_result, pushed_ok
+    )
+
+    leds.set_state(LEDState.POST_FLOW)
+    print(f"\n  [Lockout] Post-flow lockout for up to {LOCKOUT_SECS}s "
+          f"(or until clearvitals signal).")
+
+    skip_event   = asyncio.Event()
+    poll_task    = asyncio.create_task(poll_for_clearvitals(skip_event))
+    lockout_task = asyncio.create_task(asyncio.sleep(LOCKOUT_SECS))
+
+    done, pending = await asyncio.wait(
+        [poll_task, lockout_task], return_when=asyncio.FIRST_COMPLETED
+    )
+    for t in pending:
+        t.cancel()
+        try:
+            await t
+        except asyncio.CancelledError:
+            pass
+
+    leds.set_state(LEDState.WAIT_BP)
+    log_session_divider()
+    print(f"  [Lockout] Ended. Ready for next patient.\n")
+
+# ---------------------------------------------------------------------------
+# Main loop
+# ---------------------------------------------------------------------------
+
+async def main():
+    leds        = LEDController()
+    temp_sensor = TempSensor()
+    patient_num = 0
+
+    led_task = asyncio.create_task(leds.run())
+    leds.set_state(LEDState.WAIT_BP)
+
+    print("\n" + "=" * 60)
+    print("  O-Health Vitals Kiosk — BP + SpO2 + Glucose + Temp Edition")
+    print("=" * 60)
+
+    await drain_spool()
+
+    try:
+        while True:
+            trigger_kind, trigger_device = await wait_for_patient_device()
+            patient_num += 1
+            await run_patient_capture(
+                patient_num, trigger_kind, trigger_device, temp_sensor, leds
+            )
+    except KeyboardInterrupt:
+        print("\n  Shutdown requested.")
+    finally:
+        leds.shutdown()
+        led_task.cancel()
+        try:
+            await led_task
+        except asyncio.CancelledError:
+            pass
+        _console_log_fh.close()
+        print("  Goodbye.")
+
+if __name__ == "__main__":
+    asyncio.run(main())
